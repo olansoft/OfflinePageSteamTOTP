@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本地 Steam TOTP 生成器</title>
+<style>
+    body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        padding: 20px;
+        max-width: 680px;
+        margin: auto;
+        line-height: 1.4
+    }
+
+    h1 {
+        font-size: 20px;
+        margin: 0 0 12px
+    }
+
+    label {
+        display: block;
+        margin: 10px 0 6px
+    }
+
+    input[type=text] {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #ccc;
+        border-radius: 10px;
+        font-size: 14px
+    }
+
+    button {
+        padding: 10px 14px;
+        border: 0;
+        border-radius: 10px;
+        cursor: pointer;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, .1)
+    }
+
+    #start {
+        background: #4CAF50;
+        color: white;
+    }
+
+    #copy {
+        background: #2196F3;
+        color: white;
+    }
+
+    #copy:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+    }
+
+    .copy-success {
+        background: #4CAF50 !important;
+    }
+
+    .code {
+        font-size: 42px;
+        letter-spacing: 2px;
+        font-weight: 700;
+        margin-top: 12px
+    }
+
+    .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-top: 8px
+    }
+
+    small {
+        opacity: .7
+    }
+
+    .progress {
+        height: 8px;
+        background: #eee;
+        border-radius: 99px;
+        overflow: hidden
+    }
+
+    .progress>i {
+        display: block;
+        height: 100%;
+        width: 0%
+    }
+
+    footer {
+        margin-top: 16px;
+        font-size: 12px;
+        opacity: .7
+    }
+</style>
+
+<h1>本地 Steam TOTP 生成器</h1>
+<label>Secret（Base32/Base64）</label>
+<input id="secret" type="text" placeholder="例如：cnOgv/KdpLoP6Nbh0GMkXkPXALQ= 或 MNOHW7WKXFI7RZWGEQGMVFTRU7GAFIA=">
+<div class="row">
+    <button id="copy" disabled>复制</button>
+</div>
+<div class="code" id="code">———</div>
+<div class="progress"><i id="bar"></i></div>
+<div class="row"><small id="left">剩余 — s</small></div>
+<footer>完全离线计算。支持 Base32(Aegis等验证器密钥) / Base64(shared_secret) 格式。
+</footer>
+
+<script>
+    const CHARS = "23456789BCDFGHJKMNPQRTVWXY";
+    const BASE32_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+    function base32ToBase64(base32) {
+        const cleanB32 = base32.replace(/[=\s]/g, '').toUpperCase();
+        let bits = '';
+        for (const char of cleanB32) {
+            const val = BASE32_CHARS.indexOf(char);
+            if (val === -1) throw new Error('Invalid Base32');
+            bits += val.toString(2).padStart(5, '0');
+        }
+        const bytes = [];
+        for (let i = 0; i < bits.length - 7; i += 8) {
+            bytes.push(parseInt(bits.substr(i, 8), 2));
+        }
+        return btoa(String.fromCharCode(...bytes));
+    }
+
+    function detectAndConvert(secret) {
+        const clean = secret.trim().replace(/\s/g, '');
+        // 检测是否为Base32（只包含Base32字符且长度合适）
+        if (/^[A-Z2-7=]*$/i.test(clean) && clean.length % 8 === 0) {
+            try {
+                return base32ToBase64(clean);
+            } catch {
+                // 如果Base32转换失败，尝试作为Base64处理
+            }
+        }
+        return clean;
+    }
+
+    // 添加缺失的 toBytes 函数
+    function toBytes(b64) {
+        try {
+            // 清理 Base64 字符串
+            const cleanB64 = b64.replace(/[^A-Za-z0-9+/=]/g, '');
+            return Uint8Array.from(atob(cleanB64), c => c.charCodeAt(0));
+        } catch (error) {
+            throw new Error('Invalid Base64 format');
+        }
+    }
+
+    function i2bytes8(i) {
+        const b = new Uint8Array(8);
+        for (let j = 7; j >= 0; j--) { b[j] = i & 0xff; i >>= 8; }
+        return b;
+    }
+
+    // 纯 JavaScript 实现的 SHA1 算法
+    function sha1(data) {
+        function rotateLeft(n, s) {
+            return (n << s) | (n >>> (32 - s));
+        }
+
+        function addUnsigned(x, y) {
+            return ((x & 0x7FFFFFFF) + (y & 0x7FFFFFFF)) ^ (x & 0x80000000) ^ (y & 0x80000000);
+        }
+
+        function wordToHex(word) {
+            let result = "";
+            for (let i = 0; i <= 3; i++) {
+                const byte = (word >>> (i * 8)) & 255;
+                result += ("0" + byte.toString(16)).slice(-2);
+            }
+            return result;
+        }
+
+        function utf8Encode(str) {
+            const bytes = [];
+            for (let i = 0; i < str.length; i++) {
+                const code = str.charCodeAt(i);
+                if (code < 0x80) {
+                    bytes.push(code);
+                } else if (code < 0x800) {
+                    bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+                } else if (code < 0xd800 || code >= 0xe000) {
+                    bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+                } else {
+                    i++;
+                    const surrogate = str.charCodeAt(i);
+                    const utf32 = 0x10000 + (((code & 0x3ff) << 10) | (surrogate & 0x3ff));
+                    bytes.push(
+                        0xf0 | (utf32 >> 18),
+                        0x80 | ((utf32 >> 12) & 0x3f),
+                        0x80 | ((utf32 >> 6) & 0x3f),
+                        0x80 | (utf32 & 0x3f)
+                    );
+                }
+            }
+            return new Uint8Array(bytes);
+        }
+
+        let message;
+        if (typeof data === 'string') {
+            message = utf8Encode(data);
+        } else {
+            message = new Uint8Array(data);
+        }
+
+        const msgLength = message.length;
+        const wordArray = [];
+
+        for (let i = 0; i < msgLength - 3; i += 4) {
+            wordArray.push((message[i] << 24) | (message[i + 1] << 16) | (message[i + 2] << 8) | message[i + 3]);
+        }
+
+        let remainingBytes = msgLength % 4;
+        if (remainingBytes === 0) {
+            wordArray.push(0x80000000);
+        } else {
+            let lastWord = 0;
+            for (let i = msgLength - remainingBytes; i < msgLength; i++) {
+                lastWord |= message[i] << (8 * (3 - (i % 4)));
+            }
+            lastWord |= 0x80 << (8 * (3 - remainingBytes));
+            wordArray.push(lastWord);
+        }
+
+        while ((wordArray.length % 16) !== 14) {
+            wordArray.push(0);
+        }
+
+        wordArray.push(msgLength >>> 29);
+        wordArray.push((msgLength << 3) & 0x0ffffffff);
+
+        const w = new Array(80);
+        let h0 = 0x67452301;
+        let h1 = 0xEFCDAB89;
+        let h2 = 0x98BADCFE;
+        let h3 = 0x10325476;
+        let h4 = 0xC3D2E1F0;
+
+        for (let i = 0; i < wordArray.length; i += 16) {
+            for (let j = 0; j < 16; j++) {
+                w[j] = wordArray[i + j];
+            }
+            for (let j = 16; j < 80; j++) {
+                w[j] = rotateLeft(w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16], 1);
+            }
+
+            let a = h0, b = h1, c = h2, d = h3, e = h4;
+
+            for (let j = 0; j < 80; j++) {
+                let f, k;
+                if (j < 20) {
+                    f = (b & c) | ((~b) & d);
+                    k = 0x5A827999;
+                } else if (j < 40) {
+                    f = b ^ c ^ d;
+                    k = 0x6ED9EBA1;
+                } else if (j < 60) {
+                    f = (b & c) | (b & d) | (c & d);
+                    k = 0x8F1BBCDC;
+                } else {
+                    f = b ^ c ^ d;
+                    k = 0xCA62C1D6;
+                }
+
+                const temp = addUnsigned(addUnsigned(rotateLeft(a, 5), f), addUnsigned(addUnsigned(e, w[j]), k));
+                e = d;
+                d = c;
+                c = rotateLeft(b, 30);
+                b = a;
+                a = temp;
+            }
+
+            h0 = addUnsigned(a, h0);
+            h1 = addUnsigned(b, h1);
+            h2 = addUnsigned(c, h2);
+            h3 = addUnsigned(d, h3);
+            h4 = addUnsigned(e, h4);
+        }
+
+        const result = new Uint8Array(20);
+        [h0, h1, h2, h3, h4].forEach((h, i) => {
+            result[i * 4] = (h >>> 24) & 0xff;
+            result[i * 4 + 1] = (h >>> 16) & 0xff;
+            result[i * 4 + 2] = (h >>> 8) & 0xff;
+            result[i * 4 + 3] = h & 0xff;
+        });
+
+        return result;
+    }
+
+    // 纯 JavaScript 实现的 HMAC-SHA1
+    function hmacSha1Sync(keyBytes, msgBytes) {
+        const key = new Uint8Array(keyBytes);
+        const msg = new Uint8Array(msgBytes);
+
+        let keyPadded = new Uint8Array(64);
+        if (key.length > 64) {
+            const hashedKey = sha1(key);
+            keyPadded.set(hashedKey);
+        } else {
+            keyPadded.set(key);
+        }
+
+        const oKeyPad = new Uint8Array(64);
+        const iKeyPad = new Uint8Array(64);
+
+        for (let i = 0; i < 64; i++) {
+            oKeyPad[i] = keyPadded[i] ^ 0x5c;
+            iKeyPad[i] = keyPadded[i] ^ 0x36;
+        }
+
+        const innerInput = new Uint8Array(64 + msg.length);
+        innerInput.set(iKeyPad);
+        innerInput.set(msg, 64);
+        const innerHash = sha1(innerInput);
+
+        const outerInput = new Uint8Array(64 + 20);
+        outerInput.set(oKeyPad);
+        outerInput.set(innerHash, 64);
+
+        return sha1(outerInput);
+    }
+
+    // 修改 steamCode 函数使用同步版本
+    function steamCodeSync(sharedSecret, unixNow) {
+        const keyB64 = detectAndConvert(sharedSecret);
+        const key = toBytes(keyB64);
+        const ts = Math.floor(unixNow / 30);
+        const h = hmacSha1Sync(key, i2bytes8(ts));
+        const start = h[h.length - 1] & 0x0f;
+        let full = ((h[start] & 0x7f) << 24) | (h[start + 1] << 16) | (h[start + 2] << 8) | (h[start + 3]);
+        let out = "";
+        for (let i = 0; i < 5; i++) { out += CHARS[full % CHARS.length]; full = Math.floor(full / CHARS.length); }
+        return out;
+    }
+
+    // 修改 tick 函数
+    function tick() {
+        const sec = els.secret.value.trim();
+        if (!sec) {
+            els.code.textContent = "请输入 Secret";
+            els.copy.disabled = true;
+            return;
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        const left = 30 - (now % 30);
+
+        try {
+            const code = steamCodeSync(sec, now);
+            els.code.textContent = code;
+            els.bar.style.width = (left / 30 * 100).toFixed(1) + "%";
+            els.left.textContent = "剩余 " + left + " s";
+            els.copy.disabled = false;
+        } catch (e) {
+            console.error('TOTP generation error:', e);
+            els.code.textContent = "错误: " + e.message;
+            els.copy.disabled = true;
+        }
+    }
+
+    const els = {
+        secret: document.getElementById('secret'),
+        code: document.getElementById('code'),
+        bar: document.getElementById('bar'),
+        left: document.getElementById('left'),
+        copy: document.getElementById('copy')
+    };
+    let timer = null;
+
+    function getSecretFromURI() {
+        const hash = window.location.hash;
+        if (hash.startsWith("#secret=")) {
+            return decodeURIComponent(hash.substring(8)).replace(/\s/g, '+');
+        }
+        const params = new URLSearchParams(window.location.search);
+        return params.get("secret")?.replace(/\s/g, '+') || "";
+    }
+
+    async function copyCode() {
+        const code = els.code.textContent;
+        if (code === "———" || code.includes("请输入") || code.includes("无效")) return;
+
+        try {
+            await navigator.clipboard.writeText(code);
+        } catch {
+            const textArea = document.createElement('textarea');
+            textArea.value = code;
+            document.body.appendChild(textArea);
+            textArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textArea);
+        }
+
+        els.copy.textContent = "已复制";
+        els.copy.classList.add('copy-success');
+        setTimeout(() => {
+            els.copy.textContent = "复制";
+            els.copy.classList.remove('copy-success');
+        }, 1000);
+    }
+
+    window.onload = function () {
+        const secretFromURI = getSecretFromURI();
+        if (secretFromURI) {
+            els.secret.value = secretFromURI;
+        }
+        tick();
+        timer = setInterval(tick, 1000);
+    };
+
+    els.secret.addEventListener('input', () => {
+        if (timer) { clearInterval(timer); timer = null; }
+        tick();
+        timer = setInterval(tick, 1000);
+    });
+
+    document.getElementById('copy').onclick = copyCode;
+</script>
+
+</html>
